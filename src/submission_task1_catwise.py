@@ -1,3 +1,11 @@
+import transformers
+def custom_check_imports(filename):
+    imports = transformers.dynamic_module_utils.get_relative_imports(filename)
+    if "flash_attn" in imports:
+        imports.remove("flash_attn")
+    return imports
+transformers.dynamic_module_utils.check_imports = custom_check_imports
+
 from transformers import AutoModelForCausalLM
 from datasets import load_dataset
 from transformers import AutoProcessor
@@ -54,7 +62,7 @@ SUBMISSION_INFO = {
 # can add necessary library imports here
 from peft import PeftModel, PeftConfig
 
-adapter_model_id = "gauravparajuli/florence2_4_r16"
+adapter_model_id = "/home/aidslab/Desktop/ImageCLEFmed-MEDVQA-GI-2025-Task1-Baseline_1/florence2_64_r16_local"
 peft_config = PeftConfig.from_pretrained(adapter_model_id)
 base_model_id = peft_config.base_model_name_or_path
 print(base_model_id)
