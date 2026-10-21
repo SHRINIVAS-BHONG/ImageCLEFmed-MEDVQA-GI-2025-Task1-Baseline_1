@@ -42,7 +42,7 @@ def partition_dataset(
     # Check if category column exists
     features = train_dataset.column_names
     cat_col = None
-    for candidate in ['category', 'label', 'finding', 'organ']:
+    for candidate in ['source', 'category', 'label', 'finding', 'organ']:
         if candidate in features:
             cat_col = candidate
             break
