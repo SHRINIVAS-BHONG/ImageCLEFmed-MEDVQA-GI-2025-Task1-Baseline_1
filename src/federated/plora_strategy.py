@@ -96,24 +96,25 @@ class FedVLMStrategy(flwr.server.strategy.FedAvg):
             dynamic_ncols=True
         )
         with torch.no_grad():
-            for idx, ex in enumerate(eval_pbar):
-                question = ex["question"]
-                image = ex["image"].convert("RGB") if ex["image"].mode != "RGB" else ex["image"]
-                ground_truth = str(ex["answer"]).strip()
+            with torch.autocast(device_type="cuda" if "cuda" in str(self.device) else "cpu", dtype=torch.float16 if "cuda" in str(self.device) else torch.bfloat16):
+                for idx, ex in enumerate(eval_pbar):
+                    question = ex["question"]
+                    image = ex["image"].convert("RGB") if ex["image"].mode != "RGB" else ex["image"]
+                    ground_truth = str(ex["answer"]).strip()
 
-                inputs = self.processor(text=[question], images=[image], return_tensors="pt", padding=True)
-                inputs = {k: v.to(self.device) for k, v in inputs.items() if k not in ['labels', 'attention_mask']}
+                    inputs = self.processor(text=[question], images=[image], return_tensors="pt", padding=True)
+                    inputs = {k: v.to(self.device) for k, v in inputs.items() if k not in ['labels', 'attention_mask']}
 
-                output = self.eval_model.generate(**inputs, max_new_tokens=32)
-                predicted_text = self.processor.tokenizer.decode(output[0], skip_special_tokens=True).strip()
+                    output = self.eval_model.generate(**inputs, max_new_tokens=32)
+                    predicted_text = self.processor.tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-                predictions.append(predicted_text)
-                references.append(ground_truth)
-                
-                eval_pbar.set_postfix({
-                    "sample": f"{idx+1}/{len(self.eval_sub)}",
-                    "pct": f"{(idx+1)/len(self.eval_sub)*100:.1f}%"
-                })
+                    predictions.append(predicted_text)
+                    references.append(ground_truth)
+                    
+                    eval_pbar.set_postfix({
+                        "sample": f"{idx+1}/{len(self.eval_sub)}",
+                        "pct": f"{(idx+1)/len(self.eval_sub)*100:.1f}%"
+                    })
 
         # 3. Calculate metrics
         rouge_res = self.rouge.compute(predictions=predictions, references=references)
@@ -132,6 +133,9 @@ class FedVLMStrategy(flwr.server.strategy.FedAvg):
         print(f"ROUGE-1: {metrics['ROUGE-1']:.4f} | ROUGE-2: {metrics['ROUGE-2']:.4f} | ROUGE-L: {metrics['ROUGE-L']:.4f}")
         print(f"BLEU:    {metrics['BLEU']:.4f} | METEOR:  {metrics['METEOR']:.4f}")
         print("===================================================================\n")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Loss placeholder (using negative ROUGE-L as optimization criterion)
         pseudo_loss = 1.0 - metrics["ROUGE-L"]

@@ -139,8 +139,10 @@ class FedVLMPLoRAClient(flwr.client.NumPyClient):
             for step, batch in enumerate(pbar):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 
-                outputs = self.model(**batch)
-                loss = outputs.loss / self.gradient_accumulation_steps
+                with torch.autocast(device_type="cuda" if "cuda" in str(self.device) else "cpu", dtype=torch.float16 if "cuda" in str(self.device) else torch.bfloat16):
+                    outputs = self.model(**batch)
+                    loss = outputs.loss / self.gradient_accumulation_steps
+                    
                 loss.backward()
                 
                 step_loss = loss.item() * self.gradient_accumulation_steps
@@ -168,6 +170,10 @@ class FedVLMPLoRAClient(flwr.client.NumPyClient):
         avg_loss = total_loss / max(1, step_count)
         num_samples = len(self.train_subset)
         
+        del optimizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         return self.get_parameters(config={}), num_samples, {"train_loss": avg_loss}
 
     def evaluate(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[float, int, Dict]:
@@ -184,15 +190,15 @@ class FedVLMPLoRAClient(flwr.client.NumPyClient):
             dynamic_ncols=True
         )
         with torch.no_grad():
-            for batch in eval_pbar:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                outputs = self.model(**batch)
-                total_eval_loss += outputs.loss.item()
-                eval_steps += 1
-                eval_pbar.set_postfix({"val_loss": f"{outputs.loss.item():.4f}"})
+            with torch.autocast(device_type="cuda" if "cuda" in str(self.device) else "cpu", dtype=torch.float16 if "cuda" in str(self.device) else torch.bfloat16):
+                for batch in eval_pbar:
+                    batch = {k: v.to(self.device) for k, v in batch.items()}
+                    outputs = self.model(**batch)
+                    total_eval_loss += outputs.loss.item()
+                    eval_steps += 1
+                    eval_pbar.set_postfix({"val_loss": f"{outputs.loss.item():.4f}"})
                 
         avg_eval_loss = total_eval_loss / max(1, eval_steps)
-        return avg_eval_loss, len(self.val_subset), {"val_loss": avg_eval_loss}
-                
-        avg_eval_loss = total_eval_loss / max(1, eval_steps)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return avg_eval_loss, len(self.val_subset), {"val_loss": avg_eval_loss}
