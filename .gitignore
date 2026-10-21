@@ -1,7 +1,34 @@
+# Virtual environments
 venv/
 .venv/
+env/
+ENV/
+
+# Python byte-code and cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+
+# Training checkpoints & large model weights (> 100MB)
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.h5
+
+# Jupyter Notebook checkpoints
 .ipynb_checkpoints/
-src/wandb/
+*.ipynb_checkpoints
+
+# Logs, monitoring & temp
 wandb/
+src/wandb/
+*.log
+
+# OS & IDE metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
