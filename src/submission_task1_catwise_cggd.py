@@ -69,9 +69,22 @@ SUBMISSION_INFO = {
     '''
 }
 
+import argparse
+
+parser = argparse.ArgumentParser(description="Generate CGGD-SlotLoc Category-wise Submission")
+parser.add_argument("--checkpoint", type=str, default=None, help="Path to CGGD-SlotLoc checkpoint")
+parser.add_argument("--output_file", type=str, default="predictions_cggd.json", help="Output JSON filename")
+cli_args, _ = parser.parse_known_args()
+
 BASE_MODEL_ID = "microsoft/Florence-2-base-ft"
 ADAPTER_MODEL_ID = str(SRC_DIR.parent / "florence2_64_r16_local")
-CGGD_CHECKPOINT_PATH = str(SRC_DIR.parent / "checkpoints" / "cggd_slotloc_best.pt")
+
+if cli_args.checkpoint:
+    CGGD_CHECKPOINT_PATH = cli_args.checkpoint
+elif (SRC_DIR.parent / "checkpoints" / "cggd_slotloc_option_a_best.pt").exists():
+    CGGD_CHECKPOINT_PATH = str(SRC_DIR.parent / "checkpoints" / "cggd_slotloc_option_a_best.pt")
+else:
+    CGGD_CHECKPOINT_PATH = str(SRC_DIR.parent / "checkpoints" / "cggd_slotloc_best.pt")
 
 print(f"Loading Base Model: {BASE_MODEL_ID}")
 processor = AutoProcessor.from_pretrained(BASE_MODEL_ID, trust_remote_code=True)
@@ -91,12 +104,47 @@ if os.path.exists(ADAPTER_MODEL_ID):
     print(f"Loading Peft adapter from {ADAPTER_MODEL_ID}")
     base_model = PeftModel.from_pretrained(base_model, ADAPTER_MODEL_ID)
 
-# Wrap with CGGDFlorence2 architecture
-model_cggd = CGGDFlorence2(base_model, location_vocab=location_vocab).to(device)
+# Inspect checkpoint to configure architecture dynamically
+num_slots = 16
+slot_attention_type = "perceiver"
+count_loss_type = "smooth_l1"
+use_diversity = True
+state = None
 
 if os.path.exists(CGGD_CHECKPOINT_PATH):
     print(f"Loading CGGD-SlotLoc checkpoint from {CGGD_CHECKPOINT_PATH}")
-    state = torch.load(CGGD_CHECKPOINT_PATH, map_location=device)
+    raw_state = torch.load(CGGD_CHECKPOINT_PATH, map_location=device)
+    if isinstance(raw_state, dict) and "model_state" in raw_state:
+        state = raw_state["model_state"]
+        cfg = raw_state.get("config", {})
+        num_slots = cfg.get("num_slots", 4)
+        slot_attention_type = cfg.get("slot_attention_type", "competitive")
+        count_loss_type = cfg.get("count_loss_type", "poisson")
+        use_diversity = cfg.get("use_diversity", False)
+    else:
+        state = raw_state
+        if "resampler.slots_mu" in state:
+            num_slots = state["resampler.slots_mu"].shape[1]
+            slot_attention_type = "competitive"
+            count_loss_type = "poisson"
+            use_diversity = False
+        elif "resampler.queries" in state:
+            num_slots = state["resampler.queries"].shape[1]
+            slot_attention_type = "perceiver"
+            count_loss_type = "smooth_l1"
+            use_diversity = True
+
+print(f"Initializing CGGD-SlotLoc: slots={num_slots}, type={slot_attention_type}, count_loss={count_loss_type}")
+model_cggd = CGGDFlorence2(
+    base_model,
+    location_vocab=location_vocab,
+    num_slots=num_slots,
+    slot_attention_type=slot_attention_type,
+    count_loss_type=count_loss_type,
+    use_diversity=use_diversity,
+).to(device)
+
+if state is not None:
     model_cggd.load_state_dict(state, strict=False)
 else:
     print(f"Notice: Checkpoint {CGGD_CHECKPOINT_PATH} not found; running with initialized/adapter weights.")
@@ -223,8 +271,9 @@ output_data = {
     }
 }
 
-with open(output_dir / "predictions_cggd.json", "w") as f:
+output_file_name = cli_args.output_file if cli_args.output_file else "predictions_cggd.json"
+with open(output_dir / output_file_name, "w") as f:
     json.dump(output_data, f, indent=4)
 
 print(f"\nTime: {total_time}s | Mem: {final_mem}MB | Model Load Mem: {model_mem_used}MB | GPU: {gpu_name}")
-print("✅ Results successfully saved to 'predictions_cggd.json', 'cat2preds_cggd.json', and 'cat2refs_cggd.json'.")
+print(f"✅ Results successfully saved to '{output_file_name}', 'cat2preds_cggd.json', and 'cat2refs_cggd.json'.")

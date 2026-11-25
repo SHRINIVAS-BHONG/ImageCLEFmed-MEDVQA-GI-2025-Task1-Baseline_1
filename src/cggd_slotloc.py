@@ -84,9 +84,11 @@ def build_location_vocab(hf_dataset, min_freq: int = LOCATION_MIN_FREQ, max_clas
     Answers with frequency < min_freq are excluded from closed-set head (labeled -100).
     """
     c = Counter()
-    for rec in hf_dataset:
-        if classify_question_type(rec["question"]) == LOCATION_TYPE:
-            c[rec["answer"].strip().lower()] += 1
+    questions = hf_dataset["question"]
+    answers = hf_dataset["answer"]
+    for q, a in zip(questions, answers):
+        if classify_question_type(q) == LOCATION_TYPE:
+            c[a.strip().lower()] += 1
     vocab = [a for a, n in c.most_common(max_classes) if n >= min_freq]
     covered = sum(n for a, n in c.items() if a in vocab)
     total = sum(c.values())
@@ -120,8 +122,9 @@ class KvasirVQADataset(Dataset):
         self.count_bins = []
         self.location_bins = []
         type_counts = Counter()
-        for rec in self.ds:
-            q, a = rec["question"], rec["answer"]
+        questions = self.ds["question"]
+        answers = self.ds["answer"]
+        for q, a in zip(questions, answers):
             qtype = classify_question_type(q)
             count_bin = to_bin(int(a.strip())) if (qtype == COUNT_TYPE and re.fullmatch(r"\d+", a.strip())) else -100
             location_bin = to_location_bin(a, location_vocab) if qtype == LOCATION_TYPE else -100
@@ -324,6 +327,86 @@ class SlotAttentionResampler(nn.Module):
         return q
 
 
+class CompetitiveSlotAttention(nn.Module):
+
+    """
+    True Competitive Slot Attention (Locatello et al., NeurIPS 2020).
+    - Queries compete for input patch tokens via softmax normalized over the SLOT axis (dim=1).
+    - Slot initializations are sampled from a learnable Gaussian distribution N(mu, diag(sigma)).
+    - Iterative recurrent updates via GRU over num_iters iterations.
+    """
+    def __init__(self, dim: int = PROJ_DIM, num_slots: int = 4, num_iters: int = 3,
+                 eps: float = 1e-8, hidden_dim: int = PROJ_DIM):
+        super().__init__()
+        self.num_slots = num_slots
+        self.num_iters = num_iters
+        self.eps = eps
+        self.scale = dim ** -0.5
+
+        # Learnable Gaussian prior parameters for slot initialization
+        self.slots_mu = nn.Parameter(torch.randn(1, 1, dim))
+        self.slots_log_sigma = nn.Parameter(torch.zeros(1, 1, dim))
+
+        self.project_q = nn.Linear(dim, dim, bias=False)
+        self.project_k = nn.Linear(dim, dim, bias=False)
+        self.project_v = nn.Linear(dim, dim, bias=False)
+
+        self.gru = nn.GRUCell(dim, dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim)
+        )
+
+        self.norm_inputs = nn.LayerNorm(dim)
+        self.norm_slots = nn.LayerNorm(dim)
+        self.norm_mlp = nn.LayerNorm(dim)
+
+    def forward(self, patch_tokens: torch.Tensor, return_attn: bool = False):
+        B, N, D = patch_tokens.shape
+        inputs = self.norm_inputs(patch_tokens)
+        k = self.project_k(inputs)  # (B, N, D)
+        v = self.project_v(inputs)  # (B, N, D)
+
+        # Initialize slots from Gaussian prior N(mu, sigma) to maintain permutation symmetry
+        mu = self.slots_mu.expand(B, self.num_slots, -1)
+        sigma = self.slots_log_sigma.exp().expand(B, self.num_slots, -1)
+        slots = mu + sigma * torch.randn_like(mu)
+
+        attn_weights = None
+        for _ in range(self.num_iters):
+            slots_prev = slots
+            slots_norm = self.norm_slots(slots)
+            q = self.project_q(slots_norm)  # (B, K, D)
+
+            # Scaled dot-product attention
+            dots = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, K, N)
+
+            # SOFTMAX OVER THE SLOT DIMENSION (DIM=1): queries compete for keys! (Locatello et al. 2020)
+            attn = F.softmax(dots, dim=1) + self.eps  # (B, K, N)
+
+            # Spatial normalization across patches for value aggregation & downstream readout
+            attn_norm = attn / (attn.sum(dim=-1, keepdim=True) + self.eps)  # (B, K, N)
+            attn_weights = attn_norm
+            updates = torch.bmm(attn_norm, v)  # (B, K, D)
+
+            # Recurrent GRU update
+            slots = self.gru(
+                updates.view(B * self.num_slots, D),
+                slots_prev.view(B * self.num_slots, D)
+            ).view(B, self.num_slots, D)
+
+            # Residual FFN
+            slots = slots + self.mlp(self.norm_mlp(slots))
+
+        if return_attn:
+            return slots, attn_weights
+        return slots
+
+
+SlotAttention = CompetitiveSlotAttention
+
+
 def diversity_loss(queries: torch.Tensor, attn_weights: Optional[torch.Tensor] = None, spatial_weight: float = 0.5) -> torch.Tensor:
     """Encourages query slots to specialize by penalizing pairwise cosine and spatial overlap."""
     q = F.normalize(queries, dim=-1)
@@ -354,6 +437,16 @@ def count_regression_loss(pred_count: torch.Tensor, count_labels: torch.Tensor, 
     target = count_labels[valid].float().clamp(max=float(max_count))
     pred = pred_count[valid]
     return F.smooth_l1_loss(pred, target, beta=1.0)
+
+
+def poisson_count_loss(log_lambda: torch.Tensor, count_labels: torch.Tensor, max_count: int = NUM_BINS - 1) -> torch.Tensor:
+    """Poisson Negative Log-Likelihood loss on discrete integer counts."""
+    valid = count_labels != -100
+    if not valid.any():
+        return torch.zeros((), device=log_lambda.device)
+    target = count_labels[valid].float().clamp(max=float(max_count))
+    pred_log = log_lambda[valid]
+    return F.poisson_nll_loss(pred_log, target, log_input=True, full=True)
 
 
 def count_to_pseudo_logits(pred_count: torch.Tensor, num_bins: int = NUM_BINS, sigma: float = 0.75) -> torch.Tensor:
@@ -406,6 +499,11 @@ class SlotReadout(nn.Module):
 
     def forward(self, query_feats: torch.Tensor, attn_weights: torch.Tensor,
                 grid_side: int, has_global_token: bool = False) -> Dict[str, torch.Tensor]:
+        if query_feats.dim() == 2:
+            query_feats = query_feats.unsqueeze(0)
+        if attn_weights is not None and attn_weights.dim() == 2:
+            attn_weights = attn_weights.unsqueeze(0)
+
         occ_logits = self.occ_head(query_feats).squeeze(-1)            # (B, K)
         occ_probs = torch.sigmoid(occ_logits)
         soft_cardinality = occ_probs.sum(dim=1)                         # (B,)
@@ -446,6 +544,27 @@ class CountHead(nn.Module):
     def forward(self, pooled_feat: torch.Tensor, soft_cardinality: torch.Tensor) -> torch.Tensor:
         x = torch.cat([pooled_feat, soft_cardinality.unsqueeze(-1)], dim=-1)
         return self.regressor(x).squeeze(-1)
+
+
+class PoissonCountHead(nn.Module):
+    """
+    Poisson regression head predicting log-rate (log_lambda).
+    Guarantees non-negative count predictions and eliminates regression shrinkage to 0.
+    """
+    def __init__(self, dim: int = PROJ_DIM):
+        super().__init__()
+        self.regressor = nn.Sequential(
+            nn.Linear(dim + 1, dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim // 2, 1)
+        )
+
+    def forward(self, pooled_feat: torch.Tensor, soft_cardinality: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = torch.cat([pooled_feat, soft_cardinality.unsqueeze(-1)], dim=-1)
+        log_lambda = torch.clamp(self.regressor(x).squeeze(-1), min=-5.0, max=5.0)
+        pred_count = torch.exp(log_lambda)
+        return pred_count, log_lambda
 
 
 class LocationHead(nn.Module):
@@ -539,9 +658,9 @@ class CGGDFlorence2(nn.Module):
     """
     CGGD-SlotLoc Florence-2 Wrapper.
     Extends base Florence-2 with:
-    - SlotAttentionResampler (16 queries cross-attending to vision tokens)
+    - Slot Attention (Perceiver or Competitive Slot Attention)
     - SlotReadout (occupancy-weighted pooling, 3x3 spatial histogram, centroid)
-    - CountHead (Smooth L1 regression)
+    - CountHead (Smooth L1 regression or Poisson NLL regression)
     - LocationHead (CE classification)
     - TaskConditioner (soft conditioning token prefix)
     """
@@ -550,7 +669,9 @@ class CGGDFlorence2(nn.Module):
                  use_attn_concentration: bool = True, spatial_diversity_weight: float = 0.5,
                  count_class_weights: Optional[torch.Tensor] = None,
                  location_class_weights: Optional[torch.Tensor] = None,
-                 grid_side: Optional[int] = None, has_global_token: Optional[bool] = None):
+                 grid_side: Optional[int] = None, has_global_token: Optional[bool] = None,
+                 num_slots: int = NUM_QUERIES, slot_attention_type: str = "competitive",
+                 count_loss_type: str = "smooth_l1"):
         super().__init__()
         self.base = base_model
         self.location_vocab = location_vocab
@@ -564,10 +685,22 @@ class CGGDFlorence2(nn.Module):
         self.location_class_weights = location_class_weights
         self.grid_side = grid_side
         self.has_global_token = has_global_token
+        self.num_slots = num_slots
+        self.slot_attention_type = slot_attention_type
+        self.count_loss_type = count_loss_type
 
-        self.resampler = SlotAttentionResampler()
+        if slot_attention_type == "competitive":
+            self.resampler = CompetitiveSlotAttention(dim=PROJ_DIM, num_slots=num_slots)
+        else:
+            self.resampler = SlotAttentionResampler(dim=PROJ_DIM, num_queries=num_slots)
+
         self.readout = SlotReadout()
-        self.count_head = CountHead()
+
+        if count_loss_type == "poisson":
+            self.count_head = PoissonCountHead(dim=PROJ_DIM)
+        else:
+            self.count_head = CountHead(dim=PROJ_DIM)
+
         self.location_head = LocationHead(num_classes=num_location_classes)
         self.conditioner = TaskConditioner(num_location_classes=num_location_classes)
 
@@ -607,7 +740,7 @@ class CGGDFlorence2(nn.Module):
         image_tokens = self.encode_image_tokens(pixel_values)
         B = image_tokens.size(0)
         extras = {
-            "pred_count": None, "count_logits": None, "location_logits": None,
+            "pred_count": None, "log_lambda": None, "count_logits": None, "location_logits": None,
             "centroid": None, "spatial_hist": None, "soft_cardinality": None,
             "attn_weights": None, "div_loss": torch.zeros((), device=image_tokens.device),
             "conc_loss": torch.zeros((), device=image_tokens.device)
@@ -618,7 +751,14 @@ class CGGDFlorence2(nn.Module):
             query_feats, attn_weights = self.resampler(image_tokens, return_attn=True)
             grid_side = self._resolve_grid_side(image_tokens.size(1))
             slots = self.readout(query_feats, attn_weights, grid_side, has_global_token=self.has_global_token)
-            pred_count = self.count_head(slots["pooled_feat"], slots["soft_cardinality"])
+
+            if self.count_loss_type == "poisson":
+                pred_count, log_lambda = self.count_head(slots["pooled_feat"], slots["soft_cardinality"])
+                extras["log_lambda"] = log_lambda
+            else:
+                pred_count = self.count_head(slots["pooled_feat"], slots["soft_cardinality"])
+                extras["log_lambda"] = None
+
             location_logits = self.location_head(slots["pooled_feat"], slots["spatial_hist"])
             count_logits = count_to_pseudo_logits(pred_count, NUM_BINS)
 
@@ -645,6 +785,7 @@ class CGGDFlorence2(nn.Module):
                 "pred_count": pred_count, "count_logits": count_logits,
                 "location_logits": location_logits, "centroid": slots["centroid"],
                 "spatial_hist": slots["spatial_hist"], "soft_cardinality": slots["soft_cardinality"],
+                "occ_probs": slots["occ_probs"], "occ_logits": slots["occ_logits"],
                 "attn_weights": attn_weights,
             })
 
@@ -671,7 +812,11 @@ class CGGDFlorence2(nn.Module):
         if extras["pred_count"] is not None and count_labels is not None:
             valid = count_labels != -100
             if valid.any():
-                aux_count_loss = count_regression_loss(extras["pred_count"], count_labels)
+                if self.count_loss_type == "poisson" and extras["log_lambda"] is not None:
+                    aux_count_loss = poisson_count_loss(extras["log_lambda"], count_labels)
+                else:
+                    aux_count_loss = count_regression_loss(extras["pred_count"], count_labels)
+
         if extras["location_logits"] is not None and location_labels is not None:
             valid = location_labels != -100
             if valid.any():
@@ -713,3 +858,570 @@ class CGGDFlorence2(nn.Module):
                       list(self.conditioner.parameters()))
         lora_params = [p for p in self.base.parameters() if p.requires_grad]
         return aux_params, lora_params
+
+
+# ===========================================================================
+# Human-Centric Cognitive Slot Attention Architecture
+# - Top-down question priming: s_k^{(0)} = s_k^{prior} + LN(W_q h_q)
+# - Explicit background / vignette slot allocation (Slot 0 = BG)
+# - Krimmel et al. (2024) unnormalized attention mass injection into count head
+# - 9-Region Multi-Label Sigmoid Spatial Location Decoder
+# ===========================================================================
+
+SPATIAL_REGIONS = [
+    "center", "center-left", "center-right",
+    "lower-center", "lower-left", "lower-right",
+    "upper-center", "upper-left", "upper-right"
+]
+NUM_SPATIAL_REGIONS = 9
+
+
+def location_to_multihot(answer_text: str) -> torch.Tensor:
+    """
+    Encodes location string into 9-dim binary multi-hot vector.
+    'none' or empty string -> all zeros.
+    'center; lower-center' -> 1 at 'center' and 'lower-center'.
+    Handles typos like 'lower-rigth' -> 'lower-right'.
+    """
+    vec = torch.zeros(NUM_SPATIAL_REGIONS, dtype=torch.float32)
+    ans = answer_text.strip().lower()
+    if not ans or ans == "none":
+        return vec
+    ans = ans.replace("lower-rigth", "lower-right")
+    parts = [p.strip() for p in ans.split(";")]
+    for p in parts:
+        if p in SPATIAL_REGIONS:
+            vec[SPATIAL_REGIONS.index(p)] = 1.0
+    return vec
+
+
+def multihot_to_location(probs: Union[torch.Tensor, np.ndarray], threshold: float = 0.5) -> str:
+    """
+    Decodes 9-dim probabilities into canonical semicolon-separated string or 'none'.
+    Canonical delimiter is ';' without space matching test set ground truth.
+    """
+    if torch.is_tensor(probs):
+        probs = probs.detach().cpu().float().numpy()
+    selected = [SPATIAL_REGIONS[i] for i, p in enumerate(probs) if p >= threshold]
+    if not selected:
+        return "none"
+    return ";".join(selected)
+
+
+class CognitiveSlotAttention(nn.Module):
+    """
+    Cognitive Slot Attention:
+    1. Top-Down Semantic Priming:
+       Slots are initialized by combining a learnable prior with a projected question embedding:
+       s_k^{(0)} = (mu_k + sigma_k * eps) + LN(W_q h_q)
+       where h_q is the mean-pooled question representation.
+    2. Explicit Foreground vs. Background/Vignette Allocation:
+       Slot 0: Background/Vignette/Lumen slot with dedicated spatial & feature bias.
+       Slots 1..K-1: Foreground pathology/anomaly slots.
+    3. Competitive Slot Softmax:
+       Softmax over the slot axis (dim=1) enforces mutual exclusivity.
+    4. Krimmel 2024 Unnormalized Attention Mass:
+       Computes M_k = (1/N) * sum_{n=1}^N A_{k, n} for downstream scale-preserving prediction.
+    5. Iterative GRU updates with residual MLP.
+    """
+    def __init__(self, dim: int = PROJ_DIM, num_slots: int = 4, num_iters: int = 3, eps: float = 1e-8):
+        super().__init__()
+        self.num_slots = num_slots
+        self.num_iters = num_iters
+        self.eps = eps
+        self.scale = dim ** -0.5
+
+        # Slot priors
+        self.slots_mu = nn.Parameter(torch.randn(1, num_slots, dim))
+        self.slots_log_sigma = nn.Parameter(torch.zeros(1, num_slots, dim))
+
+        # Explicit Background / Vignette bias for Slot 0
+        self.bg_bias = nn.Parameter(torch.randn(1, 1, dim) * 0.05)
+
+        # Top-Down Question Priming projection
+        self.q_proj = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
+
+        self.project_q = nn.Linear(dim, dim, bias=False)
+        self.project_k = nn.Linear(dim, dim, bias=False)
+        self.project_v = nn.Linear(dim, dim, bias=False)
+
+        self.gru = nn.GRUCell(dim, dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim)
+        )
+
+        self.norm_inputs = nn.LayerNorm(dim)
+        self.norm_slots = nn.LayerNorm(dim)
+        self.norm_mlp = nn.LayerNorm(dim)
+
+    def forward(self, patch_tokens: torch.Tensor, question_embeds: torch.Tensor):
+        B, N, D = patch_tokens.shape
+        inputs = self.norm_inputs(patch_tokens)
+        k = self.project_k(inputs)  # (B, N, D)
+        v = self.project_v(inputs)  # (B, N, D)
+
+        # Top-down question priming
+        q_priming = self.q_proj(question_embeds).unsqueeze(1)  # (B, 1, D)
+
+        # Slot initializations
+        mu = self.slots_mu.expand(B, self.num_slots, -1)
+        sigma = self.slots_log_sigma.exp().expand(B, self.num_slots, -1)
+
+        if self.training:
+            base_slots = mu + sigma * torch.randn_like(mu)
+        else:
+            base_slots = mu
+
+        # Inject Top-down priming across slots
+        slots = base_slots + q_priming
+
+        # Inject Background/Vignette Bias into Slot 0
+        slots_bg = slots[:, 0:1, :] + self.bg_bias
+        slots_fg = slots[:, 1:, :]
+        slots = torch.cat([slots_bg, slots_fg], dim=1)
+
+        attn_weights = None
+        for _ in range(self.num_iters):
+            slots_prev = slots
+            slots_norm = self.norm_slots(slots)
+            q = self.project_q(slots_norm)  # (B, K, D)
+
+            dots = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, K, N)
+
+            # Competitive Softmax over slots (dim=1)
+            attn = F.softmax(dots, dim=1) + self.eps  # (B, K, N)
+            attn_weights = attn
+
+            # Normalized attention over patches for value update
+            attn_norm = attn / attn.sum(dim=-1, keepdim=True)  # (B, K, N)
+            updates = torch.bmm(attn_norm, v)  # (B, K, D)
+
+            # GRU update
+            slots = self.gru(
+                updates.view(B * self.num_slots, D),
+                slots_prev.view(B * self.num_slots, D)
+            ).view(B, self.num_slots, D)
+
+            # Residual MLP
+            slots = slots + self.mlp(self.norm_mlp(slots))
+
+        # Krimmel et al. (2024): Scale-Preserving Attention Mass
+        mass = attn_weights.sum(dim=-1) / N  # (B, K)
+
+        return slots, attn_weights, mass
+
+
+class CognitiveSlotReadout(nn.Module):
+    """
+    Cognitive Readout separating Foreground (Slots 1..K-1) from Background (Slot 0).
+    """
+    def __init__(self, dim: int = PROJ_DIM, spatial_bins: int = 3):
+        super().__init__()
+        self.occ_head = nn.Linear(dim, 1)
+        self.spatial_bins = spatial_bins
+
+    def forward(self, slots: torch.Tensor, attn_weights: torch.Tensor, mass: torch.Tensor,
+                grid_side: int = 24, has_global_token: bool = False):
+        B, K, D = slots.shape
+        # Slot 0 is Background/Vignette; Slots 1..K-1 are Foreground
+        fg_slots = slots[:, 1:, :]           # (B, K-1, D)
+        fg_attn_full = attn_weights[:, 1:, :] # (B, K-1, N)
+        fg_attn = fg_attn_full[:, :, 1:] if has_global_token else fg_attn_full # (B, K-1, grid_side*grid_side)
+        fg_mass = mass[:, 1:]                # (B, K-1)
+        bg_mass = mass[:, 0:1]               # (B, 1)
+
+        # Occupancy on foreground slots
+        occ_logits = self.occ_head(fg_slots).squeeze(-1)  # (B, K-1)
+        occ_probs = torch.sigmoid(occ_logits)             # (B, K-1)
+        soft_cardinality = occ_probs.sum(dim=1)            # (B,)
+
+        # Occupancy-weighted pooled foreground feature
+        weights = occ_probs.unsqueeze(-1)                  # (B, K-1, 1)
+        pooled_feat = (weights * fg_slots).sum(1) / weights.sum(1).clamp_min(1e-6) # (B, D)
+
+        # Spatial histogram from foreground attention
+        fg_attn_norm = fg_attn / fg_attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        fg_attn_2d = fg_attn_norm.view(B * (K - 1), 1, grid_side, grid_side)
+        binned = F.adaptive_avg_pool2d(fg_attn_2d, (self.spatial_bins, self.spatial_bins))
+        binned = binned.view(B, K - 1, self.spatial_bins * self.spatial_bins)
+        binned = binned / binned.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        occ_w = occ_probs.unsqueeze(-1)
+        occ_w_sum = occ_w.sum(dim=1).clamp_min(1e-6)
+        spatial_hist = (occ_w * binned).sum(dim=1) / occ_w_sum  # (B, 9)
+
+        # Soft Centroid
+        rows = torch.arange(grid_side, device=slots.device, dtype=slots.dtype).repeat_interleave(grid_side)
+        cols = torch.arange(grid_side, device=slots.device, dtype=slots.dtype).repeat(grid_side)
+        denom = max(grid_side - 1, 1)
+        row_exp = (fg_attn_norm * rows.view(1, 1, -1)).sum(-1) / denom
+        col_exp = (fg_attn_norm * cols.view(1, 1, -1)).sum(-1) / denom
+        occ_sum_1d = occ_probs.sum(dim=1).clamp_min(1e-6)
+        centroid_row = (occ_probs * row_exp).sum(1) / occ_sum_1d
+        centroid_col = (occ_probs * col_exp).sum(1) / occ_sum_1d
+        centroid = torch.stack([centroid_row, centroid_col], dim=-1)  # (B, 2)
+
+        return {
+            "slots": slots,
+            "fg_slots": fg_slots,
+            "pooled_feat": pooled_feat,
+            "occ_logits": occ_logits,
+            "occ_probs": occ_probs,
+            "soft_cardinality": soft_cardinality,
+            "spatial_hist": spatial_hist,
+            "centroid": centroid,
+            "mass": mass,
+            "fg_mass": fg_mass,
+            "bg_mass": bg_mass,
+        }
+
+
+class CognitivePoissonCountHead(nn.Module):
+    """
+    Poisson regression head injecting Krimmel (2024) unnormalized attention mass
+    alongside pooled features, soft cardinality, and occupancy probabilities.
+    Resolves rate inversion by preventing area normalization.
+    """
+    def __init__(self, dim: int = PROJ_DIM, num_slots: int = 4):
+        super().__init__()
+        in_dim = dim + 1 + num_slots + (num_slots - 1)
+        self.regressor = nn.Sequential(
+            nn.Linear(in_dim, dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim // 2, 1)
+        )
+
+    def forward(self, pooled_feat: torch.Tensor, soft_cardinality: torch.Tensor,
+                mass: torch.Tensor, occ_probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = torch.cat([pooled_feat, soft_cardinality.unsqueeze(-1), mass, occ_probs], dim=-1)
+        log_lambda = torch.clamp(self.regressor(x).squeeze(-1), min=-5.0, max=5.0)
+        pred_count = torch.exp(log_lambda)
+        return pred_count, log_lambda
+
+
+class MultiLabelLocationHead(nn.Module):
+    """
+    Multi-label spatial location head predicting independent binary logits
+    across the 9 anatomical regions ('upper-left' to 'lower-right').
+    Eliminates closed-set 12-class out-of-vocabulary test errors.
+    """
+    def __init__(self, dim: int = PROJ_DIM, num_regions: int = NUM_SPATIAL_REGIONS, num_slots: int = 4):
+        super().__init__()
+        in_dim = dim + num_regions + (num_slots - 1)
+        self.classifier = nn.Sequential(
+            nn.Linear(in_dim, dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim // 2, num_regions)
+        )
+
+    def forward(self, pooled_feat: torch.Tensor, spatial_hist: torch.Tensor, fg_mass: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([pooled_feat, spatial_hist, fg_mass], dim=-1)
+        return self.classifier(x)  # (B, 9)
+
+
+class CognitiveTaskConditioner(nn.Module):
+    """
+    Task conditioning prefix token generator for Florence-2 decoder:
+    - Count queries: conditioned on Poisson predicted rate
+    - Location queries: conditioned on 9-region probabilities and spatial histogram
+    - Other queries: conditioned on pooled foreground features
+    """
+    def __init__(self, dim: int = PROJ_DIM, num_regions: int = NUM_SPATIAL_REGIONS):
+        super().__init__()
+        self.count_proj = nn.Sequential(nn.Linear(1, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.loc_proj = nn.Sequential(nn.Linear(num_regions * 2, dim), nn.GELU(), nn.Linear(dim, dim))
+
+        self.proj_count = nn.Linear(dim * 2, dim)
+        self.proj_location = nn.Linear(dim * 2, dim)
+        self.proj_plain = nn.Linear(dim, dim)
+
+    def forward(self, pooled_feat: torch.Tensor, pred_count: torch.Tensor,
+                location_logits: torch.Tensor, spatial_hist: torch.Tensor,
+                is_count_mask: torch.Tensor, is_location_mask: torch.Tensor) -> torch.Tensor:
+        count_embed = self.count_proj(pred_count.unsqueeze(-1))
+        count_token = self.proj_count(torch.cat([pooled_feat, count_embed], dim=-1))
+
+        loc_probs = torch.sigmoid(location_logits)
+        loc_embed = self.loc_proj(torch.cat([loc_probs, spatial_hist], dim=-1))
+        location_token = self.proj_location(torch.cat([pooled_feat, loc_embed], dim=-1))
+
+        plain_token = self.proj_plain(pooled_feat)
+
+        cm = is_count_mask.view(-1, 1).to(pooled_feat.dtype)
+        lm = is_location_mask.view(-1, 1).to(pooled_feat.dtype)
+        other = (1.0 - cm) * (1.0 - lm)
+        token = cm * count_token + lm * location_token + other * plain_token
+        return token.unsqueeze(1)  # (B, 1, D)
+
+
+class CognitiveCGGDFlorence2(nn.Module):
+    """
+    Cognitive CGGD-SlotLoc Florence-2 Architecture.
+    Blends:
+    - Top-Down Question-Guided Slot Initialization
+    - Explicit Foreground vs. Background/Vignette Slot Allocation (Slot 0 = BG)
+    - Scale-Preserving Attention Mass (Krimmel et al., TMLR 2024)
+    - 9-Region Multi-Label Sigmoid Spatial Location Decoder
+    - Cognitive Task Conditioning Prefix Token
+    """
+    def __init__(self, base_model, num_slots: int = 4, num_iters: int = 3,
+                 use_conditioning: bool = True, use_attn_concentration: bool = True,
+                 spatial_bins: int = 3, grid_side: Optional[int] = None,
+                 has_global_token: Optional[bool] = None):
+        super().__init__()
+        self.base = base_model
+        self.num_slots = num_slots
+        self.num_iters = num_iters
+        self.use_conditioning = use_conditioning
+        self.use_attn_concentration = use_attn_concentration
+        self.spatial_bins = spatial_bins
+        self.grid_side = grid_side
+        self.has_global_token = has_global_token
+
+        # Cognitive modules
+        self.slot_attn = CognitiveSlotAttention(dim=PROJ_DIM, num_slots=num_slots, num_iters=num_iters)
+        self.readout = CognitiveSlotReadout(dim=PROJ_DIM, spatial_bins=spatial_bins)
+        self.count_head = CognitivePoissonCountHead(dim=PROJ_DIM, num_slots=num_slots)
+        self.location_head = MultiLabelLocationHead(dim=PROJ_DIM, num_regions=NUM_SPATIAL_REGIONS, num_slots=num_slots)
+        self.conditioner = CognitiveTaskConditioner(dim=PROJ_DIM, num_regions=NUM_SPATIAL_REGIONS)
+
+        # Match base model precision
+        if hasattr(base_model, "dtype") and base_model.dtype in (torch.bfloat16, torch.float16):
+            self.slot_attn.to(base_model.dtype)
+            self.readout.to(base_model.dtype)
+            self.count_head.to(base_model.dtype)
+            self.location_head.to(base_model.dtype)
+            self.conditioner.to(base_model.dtype)
+
+    def encode_image_tokens(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.base._encode_image(pixel_values)
+
+    def _resolve_grid_side(self, num_patches: int) -> int:
+        if self.grid_side is not None:
+            return self.grid_side
+        side = int(round(math.sqrt(num_patches)))
+        if side * side == num_patches:
+            self.grid_side = side
+            self.has_global_token = False
+            return side
+        side_plus1 = int(round(math.sqrt(num_patches - 1)))
+        if num_patches > 1 and side_plus1 * side_plus1 == num_patches - 1:
+            self.grid_side = side_plus1
+            self.has_global_token = True
+            return side_plus1
+        raise ValueError(
+            f"Patch token count {num_patches} is neither a perfect square nor square+1."
+        )
+
+    def compute_embeds(self, pixel_values: torch.Tensor, input_ids: torch.Tensor,
+                       attention_mask: torch.Tensor, is_count_mask: Optional[torch.Tensor] = None,
+                       is_location_mask: Optional[torch.Tensor] = None):
+        image_tokens = self.encode_image_tokens(pixel_values)
+        B = image_tokens.size(0)
+        extras = {
+            "pred_count": None, "log_lambda": None, "location_logits": None,
+            "centroid": None, "spatial_hist": None, "soft_cardinality": None,
+            "attn_weights": None, "mass": None,
+            "conc_loss": torch.zeros((), device=image_tokens.device)
+        }
+        extra_embeds = None
+
+        # Text embeddings & Question pooling for Top-Down Priming
+        text_embeds = self.base.get_input_embeddings()(input_ids)
+        t_mask = attention_mask.unsqueeze(-1).to(text_embeds.dtype)
+        question_embeds = (text_embeds * t_mask).sum(dim=1) / t_mask.sum(dim=1).clamp_min(1.0)
+
+        slots, attn_weights, mass = self.slot_attn(image_tokens, question_embeds)
+        grid_side = self._resolve_grid_side(image_tokens.size(1))
+        readout = self.readout(slots, attn_weights, mass, grid_side=grid_side, has_global_token=self.has_global_token)
+
+        pred_count, log_lambda = self.count_head(
+            readout["pooled_feat"], readout["soft_cardinality"], readout["mass"], readout["occ_probs"]
+        )
+        location_logits = self.location_head(
+            readout["pooled_feat"], readout["spatial_hist"], readout["fg_mass"]
+        )
+
+        icm = is_count_mask if is_count_mask is not None else torch.zeros(B, device=image_tokens.device)
+        ilm = is_location_mask if is_location_mask is not None else torch.zeros(B, device=image_tokens.device)
+
+        if self.use_conditioning:
+            extra_embeds = self.conditioner(
+                readout["pooled_feat"], pred_count, location_logits, readout["spatial_hist"], icm, ilm
+            )
+
+        if self.use_attn_concentration:
+            extras["conc_loss"] = attention_concentration_loss(attn_weights)
+
+        extras.update({
+            "pred_count": pred_count,
+            "log_lambda": log_lambda,
+            "location_logits": location_logits,
+            "centroid": readout["centroid"],
+            "spatial_hist": readout["spatial_hist"],
+            "soft_cardinality": readout["soft_cardinality"],
+            "occ_probs": readout["occ_probs"],
+            "occ_logits": readout["occ_logits"],
+            "attn_weights": attn_weights,
+            "mass": readout["mass"],
+            "fg_mass": readout["fg_mass"],
+            "bg_mass": readout["bg_mass"],
+        })
+
+        merged_image_embeds = image_tokens if extra_embeds is None else torch.cat([extra_embeds, image_tokens], dim=1)
+        inputs_embeds = torch.cat([merged_image_embeds, text_embeds], dim=1)
+        img_mask = torch.ones(inputs_embeds.size(0), merged_image_embeds.size(1),
+                               device=inputs_embeds.device, dtype=attention_mask.dtype)
+        full_attention_mask = torch.cat([img_mask, attention_mask], dim=1)
+        return inputs_embeds, full_attention_mask, extras
+
+    def forward(self, input_ids: torch.Tensor, pixel_values: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None,
+                count_labels: Optional[torch.Tensor] = None,
+                location_targets: Optional[torch.Tensor] = None,
+                location_masks: Optional[torch.Tensor] = None):
+        is_count_mask = (count_labels != -100).float() if count_labels is not None else None
+        is_loc_mask = location_masks if location_masks is not None else None
+
+        inputs_embeds, full_attention_mask, extras = self.compute_embeds(
+            pixel_values, input_ids, attention_mask,
+            is_count_mask=is_count_mask, is_location_mask=is_loc_mask
+        )
+        dev = inputs_embeds.device
+        aux_count_loss = torch.zeros((), device=dev)
+        aux_location_loss = torch.zeros((), device=dev)
+
+        if extras["log_lambda"] is not None and count_labels is not None:
+            valid_cnt = count_labels != -100
+            if valid_cnt.any():
+                aux_count_loss = poisson_count_loss(extras["log_lambda"], count_labels)
+
+        if extras["location_logits"] is not None and location_targets is not None:
+            valid_loc = (location_masks == 1.0) if location_masks is not None else torch.ones(input_ids.size(0), dtype=torch.bool, device=dev)
+            if valid_loc.any():
+                aux_location_loss = F.binary_cross_entropy_with_logits(
+                    extras["location_logits"][valid_loc], location_targets[valid_loc]
+                )
+
+        outputs = self.base.language_model(
+            inputs_embeds=inputs_embeds, attention_mask=full_attention_mask, labels=labels
+        )
+        return outputs, aux_count_loss, extras["conc_loss"], aux_location_loss
+
+    @torch.no_grad()
+    def generate_answer(self, input_ids: torch.Tensor, pixel_values: torch.Tensor,
+                         attention_mask: torch.Tensor, is_count: Optional[Union[bool, torch.Tensor]] = None,
+                         is_location: Optional[Union[bool, torch.Tensor]] = None, **gen_kwargs):
+        B = pixel_values.size(0)
+        is_count_mask = None if is_count is None else (
+            is_count if torch.is_tensor(is_count) else torch.tensor([float(is_count)] * B, device=pixel_values.device))
+        is_location_mask = None if is_location is None else (
+            is_location if torch.is_tensor(is_location) else torch.tensor([float(is_location)] * B, device=pixel_values.device))
+        inputs_embeds, full_attention_mask, extras = self.compute_embeds(
+            pixel_values, input_ids, attention_mask,
+            is_count_mask=is_count_mask, is_location_mask=is_location_mask
+        )
+        gen_ids = self.base.language_model.generate(
+            inputs_embeds=inputs_embeds, attention_mask=full_attention_mask, **gen_kwargs
+        )
+        return gen_ids, extras
+
+    def trainable_parameters(self):
+        params = (list(self.slot_attn.parameters()) + list(self.readout.parameters()) +
+                  list(self.count_head.parameters()) + list(self.location_head.parameters()) +
+                  list(self.conditioner.parameters()))
+        params += [p for p in self.base.parameters() if p.requires_grad]
+        return params
+
+    def trainable_parameter_groups(self):
+        aux_params = (list(self.slot_attn.parameters()) + list(self.readout.parameters()) +
+                      list(self.count_head.parameters()) + list(self.location_head.parameters()) +
+                      list(self.conditioner.parameters()))
+        lora_params = [p for p in self.base.parameters() if p.requires_grad]
+        return aux_params, lora_params
+
+
+class CognitiveKvasirVQADataset(Dataset):
+    """
+    Cognitive dataset wrapper:
+    Adds question-type classification, count bin labels, and 9-region multi-hot targets.
+    """
+    def __init__(self, hf_dataset, name: str = "dataset"):
+        self.ds = hf_dataset
+        self.qtypes = []
+        self.count_bins = []
+        self.location_multihots = []
+        self.location_masks = []
+        type_counts = Counter()
+        questions = self.ds["question"]
+        answers = self.ds["answer"]
+        for q, a in zip(questions, answers):
+            qtype = classify_question_type(q)
+            count_bin = to_bin(int(a.strip())) if (qtype == COUNT_TYPE and re.fullmatch(r"\d+", a.strip())) else -100
+            if qtype == LOCATION_TYPE:
+                loc_vec = location_to_multihot(a)
+                loc_mask = 1.0
+            else:
+                loc_vec = torch.zeros(NUM_SPATIAL_REGIONS, dtype=torch.float32)
+                loc_mask = 0.0
+            self.qtypes.append(qtype)
+            self.count_bins.append(count_bin)
+            self.location_multihots.append(loc_vec)
+            self.location_masks.append(loc_mask)
+            type_counts[qtype] += 1
+
+        n_loc = sum(self.location_masks)
+        n_cnt = sum(1 for b in self.count_bins if b != -100)
+        print(f"[{name}] {len(self.ds)} rows -- distribution: {dict(type_counts)} | count: {n_cnt}, location: {int(n_loc)}")
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx: int):
+        rec = self.ds[idx]
+        image = rec["image"]
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        return {
+            "image": image,
+            "question": rec["question"],
+            "answer": rec["answer"],
+            "question_type": self.qtypes[idx],
+            "count_bin": self.count_bins[idx],
+            "location_multihot": self.location_multihots[idx],
+            "location_mask": self.location_masks[idx],
+            "img_id": rec.get("img_id", idx),
+        }
+
+
+def cognitive_collate_fn(batch, processor):
+    images = [b["image"] for b in batch]
+    questions = [b["question"] for b in batch]
+    answers = [b["answer"] for b in batch]
+    qtypes = [b["question_type"] for b in batch]
+    count_bins = torch.tensor([b["count_bin"] for b in batch], dtype=torch.long)
+    location_multihots = torch.stack([b["location_multihot"] for b in batch])
+    location_masks = torch.tensor([b["location_mask"] for b in batch], dtype=torch.float32)
+
+    enc = processor(text=questions, images=images, return_tensors="pt", padding=True)
+    with processor.tokenizer.as_target_tokenizer():
+        labels = processor.tokenizer(answers, return_tensors="pt", padding=True).input_ids
+    labels[labels == processor.tokenizer.pad_token_id] = -100
+
+    return {
+        "input_ids": enc["input_ids"],
+        "attention_mask": enc["attention_mask"],
+        "pixel_values": enc["pixel_values"],
+        "labels": labels,
+        "count_labels": count_bins,
+        "location_targets": location_multihots,
+        "location_masks": location_masks,
+        "question_types": qtypes,
+    }

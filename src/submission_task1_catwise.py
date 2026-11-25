@@ -74,7 +74,7 @@ processor = AutoProcessor.from_pretrained(base_model_id, trust_remote_code=True)
 # Load adapter on top of the base model
 model_hf = PeftModel.from_pretrained(model, adapter_model_id).to(device)
 model_hf.eval()  # Ensure model is in evaluation mode
-# 🏁----------------END  SUBMISISON DETAILS and MODEL LOADING -----------------🏁#
+# ----------------END  SUBMISISON DETAILS and MODEL LOADING -----------------#
 
 start_time, post_model_mem = time.time(), get_mem()
 total_time, final_mem = round(
